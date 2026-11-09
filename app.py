@@ -5,6 +5,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from uni_data import (
+    IELTS_REACH_TOLERANCE,
+    SAT_REACH_TOLERANCE,
+    STRICTNESS_REACH,
+    STRICTNESS_SAFETY,
+    fetch_scorecard_universities,
+    find_matches,
+    sample_universities,
+)
+
 st.set_page_config(page_title="University Finder", page_icon="🎓", layout="wide")
 
 METRICS = {
@@ -154,8 +164,9 @@ st.title("🎓 University Finder")
 st.markdown("**Question:** Given what a student cares about and where they want to study, "
             "which universities are the best match, and which ones are similar to a university they already like?")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Find my university", "Find similar universities",
-                                  "Explore the data", "About the data"])
+tab1, tab_uni, tab2, tab3, tab4 = st.tabs(["Find my university", "University Finder",
+                                          "Find similar universities", "Explore the data",
+                                          "About the data"])
 
 # ---------------------------------------------------------------
 # TAB 1: FINDER
@@ -205,7 +216,142 @@ with tab1:
             st.caption("Shows which countries have the most universities that fit your preferences.")
 
 # ---------------------------------------------------------------
-# TAB 2: SIMILAR
+# TAB 2: UNIVERSITY FINDER (ADMISSIONS)
+# ---------------------------------------------------------------
+with tab_uni:
+    st.markdown("Check your **SAT and IELTS scores** against admission requirements and keep only "
+                "universities inside your **annual tuition budget**. The first tab matches you on "
+                "academic reputation; this tab answers where you can realistically apply.")
+
+    with st.expander("Data source"):
+        use_live = st.checkbox("Use live data from the US College Scorecard API (US only)",
+                               key="uf_use_live")
+        api_key = st.text_input(
+            "College Scorecard API key",
+            value=os.environ.get("COLLEGE_SCORECARD_API_KEY", "DEMO_KEY"),
+            type="password",
+            disabled=not use_live,
+            help="Request a free key at https://collegescorecard.ed.gov/data/api/. "
+                 "DEMO_KEY allows a few requests per hour.",
+        )
+        st.caption("The College Scorecard publishes SAT scores (25th percentile where available, "
+                   "otherwise the average of admitted students), admission rates and out-of-state "
+                   "tuition for US institutions, but no IELTS requirements, so live rows are "
+                   "matched on SAT only and universities that report no SAT score are skipped. "
+                   "The built-in sample covers several countries with illustrative requirements.")
+
+    if use_live:
+        uni_df = fetch_scorecard_universities(api_key)
+        if uni_df.empty:
+            st.warning("Could not load live data (check the API key and your connection). "
+                       "Showing the built-in sample dataset instead.")
+            uni_df = sample_universities()
+        else:
+            st.caption(f"Live source: {len(uni_df):,} SAT-reporting US universities from the "
+                       "College Scorecard.")
+    else:
+        uni_df = sample_universities()
+        st.caption(f"Built-in sample: {len(uni_df)} universities in "
+                   f"{uni_df['country'].nunique()} countries.")
+
+    s1, s2, s3 = st.columns(3)
+    sat_score = s1.slider("SAT overall score", 400, 1600, 1300, step=10, key="uf_sat")
+    ielts_score = s2.slider("IELTS overall score", 0.0, 9.0, 6.5, step=0.5, key="uf_ielts")
+    max_budget = s3.slider("Maximum annual tuition (USD)", 0, 80000, 40000, step=1000,
+                           format="$%d", key="uf_budget")
+
+    f1, f2 = st.columns([3, 2])
+    target_countries = f1.multiselect("Target country (empty = all)",
+                                      sorted(uni_df["country"].dropna().unique()),
+                                      key="uf_countries")
+    strictness = f2.selectbox(
+        "Match strictness", [STRICTNESS_SAFETY, STRICTNESS_REACH], key="uf_strictness",
+        help=f"Safety / Target: your score meets or beats the requirement. "
+             f"Reach: the requirement is up to {SAT_REACH_TOLERANCE} SAT points or "
+             f"{IELTS_REACH_TOLERANCE} IELTS bands above your score.",
+    )
+
+    matches = find_matches(uni_df, sat_score, ielts_score, max_budget,
+                           target_countries, strictness)
+
+    st.divider()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total matches found", f"{len(matches):,}")
+    avg_tuition = matches["annual_tuition_usd"].mean()
+    m2.metric("Average tuition of matches",
+              f"${avg_tuition:,.0f}" if pd.notna(avg_tuition) else "—")
+    best_acceptance = matches["acceptance_rate"].max()
+    m3.metric("Highest acceptance rate",
+              f"{best_acceptance * 100:.0f}%" if pd.notna(best_acceptance) else "—")
+
+    if matches.empty:
+        st.info("**No universities match these criteria.** Your scores or budget are tighter "
+                "than every requirement in the current dataset.")
+        pool = uni_df if not target_countries else uni_df[uni_df["country"].isin(target_countries)]
+        cheapest = pool["annual_tuition_usd"].min()
+        lowest_sat = pool["min_sat_overall"].min()
+        lowest_ielts = pool["min_ielts_overall"].min()
+        tips = []
+        if pd.notna(cheapest) and cheapest > max_budget:
+            tips.append(f"Raise the budget to at least **${cheapest:,.0f}**, the cheapest option "
+                        "in this pool.")
+        if pd.notna(lowest_sat) and lowest_sat > sat_score:
+            tips.append(f"The lowest SAT requirement here is **{lowest_sat:.0f}** "
+                        f"(your score: {sat_score}).")
+        if pd.notna(lowest_ielts) and lowest_ielts > ielts_score:
+            tips.append(f"The lowest IELTS requirement here is **{lowest_ielts:.1f}** "
+                        f"(your score: {ielts_score:.1f}).")
+        if strictness == STRICTNESS_SAFETY:
+            tips.append(f"Switch Match strictness to **Reach** to include universities up to "
+                        f"{SAT_REACH_TOLERANCE} SAT points / {IELTS_REACH_TOLERANCE} IELTS bands "
+                        "above your scores.")
+        else:
+            tips.append("Switch Match strictness to **Safety / Target** to see universities you "
+                        "already qualify for.")
+        if target_countries:
+            tips.append("Remove the **Target country** filter to widen the pool.")
+        st.markdown("**Try this:**")
+        for tip in tips:
+            st.markdown(f"- {tip}")
+    else:
+        matches["SAT delta"] = matches["sat_margin"].map(
+            lambda v: f"{v:+.0f}" if pd.notna(v) else "—")
+        matches["IELTS delta"] = matches["ielts_margin"].map(
+            lambda v: f"{v:+.1f}" if pd.notna(v) else "—")
+
+        st.dataframe(
+            matches[["name", "country", "min_sat_overall", "SAT delta", "min_ielts_overall",
+                     "IELTS delta", "annual_tuition_usd", "acceptance_rate_pct",
+                     "website_url"]],
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "name": st.column_config.TextColumn("University", width="medium"),
+                "country": "Country",
+                "min_sat_overall": st.column_config.NumberColumn(
+                    "SAT requirement", format="%d",
+                    help="Required SAT overall score (25th percentile, or the average of admitted "
+                         "students where the percentile is unavailable, for live data)."),
+                "SAT delta": st.column_config.TextColumn(
+                    "SAT delta", width="small",
+                    help="Your SAT score minus the requirement (positive = you clear it)."),
+                "min_ielts_overall": st.column_config.NumberColumn(
+                    "IELTS requirement", format="%.1f"),
+                "IELTS delta": st.column_config.TextColumn(
+                    "IELTS delta", width="small",
+                    help="Your IELTS score minus the requirement (positive = you clear it)."),
+                "annual_tuition_usd": st.column_config.NumberColumn(
+                    "Annual tuition", format="$%d", help="USD per year."),
+                "acceptance_rate_pct": st.column_config.NumberColumn(
+                    "Acceptance rate", format="%.0f%%"),
+                "website_url": st.column_config.LinkColumn("Website", display_text="Visit site"),
+            },
+        )
+        st.caption("Sorted by annual tuition, cheapest first. Click a column header to re-sort. "
+                   "A dash means the requirement is not published.")
+
+# ---------------------------------------------------------------
+# TAB 3: SIMILAR
 # ---------------------------------------------------------------
 with tab2:
     st.markdown("Pick a university you like. The app compares the scores of all 9 metrics "
@@ -252,7 +398,7 @@ with tab2:
             width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------
-# TAB 3: EXPLORE
+# TAB 4: EXPLORE
 # ---------------------------------------------------------------
 with tab3:
     st.subheader("Countries with the most universities in the top N")
@@ -301,7 +447,7 @@ with tab3:
                "A negative number means better-ranked universities score higher.")
 
 # ---------------------------------------------------------------
-# TAB 4: ABOUT
+# TAB 5: ABOUT
 # ---------------------------------------------------------------
 with tab4:
     st.markdown("""
