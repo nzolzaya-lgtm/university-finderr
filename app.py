@@ -5,6 +5,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from groq_service import (
+    GROQ_MODEL,
+    GROQ_SOURCE,
+    get_api_key,
+    lookup_requirements,
+)
 from uni_data import (
     IELTS_REACH_TOLERANCE,
     SAT_REACH_TOLERANCE,
@@ -164,9 +170,10 @@ st.title("🎓 University Finder")
 st.markdown("**Question:** Given what a student cares about and where they want to study, "
             "which universities are the best match, and which ones are similar to a university they already like?")
 
-tab1, tab_uni, tab2, tab3, tab4 = st.tabs(["Find my university", "University Finder",
-                                          "Find similar universities", "Explore the data",
-                                          "About the data"])
+tab1, tab_uni, tab_req, tab2, tab3, tab4 = st.tabs([
+    "Find my university", "University Finder", "Requirement lookup",
+    "Find similar universities", "Explore the data", "About the data",
+])
 
 # ---------------------------------------------------------------
 # TAB 1: FINDER
@@ -351,7 +358,104 @@ with tab_uni:
                    "A dash means the requirement is not published.")
 
 # ---------------------------------------------------------------
-# TAB 3: SIMILAR
+# TAB 3: REQUIREMENT LOOKUP (GROQ)
+# ---------------------------------------------------------------
+with tab_req:
+    st.markdown("Look up a university's **SAT and IELTS requirements, annual tuition and "
+                "acceptance rate**. Groq extracts the numbers from the model's knowledge; "
+                "without an API key the app searches its bundled offline database instead.")
+
+    has_api_key = bool(get_api_key())
+    with st.form("requirement_lookup"):
+        name_col, submit_col = st.columns([4, 1], vertical_alignment="bottom")
+        query = name_col.text_input(
+            "University name",
+            placeholder="e.g. University of Toronto",
+            key="req_query_input",
+        )
+        submitted = submit_col.form_submit_button("Extract requirements", type="primary")
+
+    if submitted and query.strip():
+        st.session_state["req_active_query"] = query.strip()
+    active_query = st.session_state.get("req_active_query", "")
+
+    if has_api_key:
+        st.caption(f"Using Groq `{GROQ_MODEL}` in JSON mode; answers are cached for 24 hours.")
+    else:
+        st.caption("No `GROQ_API_KEY` found, so the bundled offline database is used. Add the "
+                   "key to `.streamlit/secrets.toml` or your environment to extract any "
+                   "university.")
+
+    if not active_query:
+        st.info("Search for a university above, or try **MIT**, **University of Oxford**, "
+                "**University of Toronto** or **ETH Zurich**.")
+    else:
+        record, source, error_type = lookup_requirements(active_query)
+
+        if error_type:
+            st.warning(f"Groq could not answer ({error_type}), so the bundled data is shown "
+                       "instead.")
+
+        if record is None:
+            st.warning(f"No bundled data for **{active_query}**.")
+            if has_api_key:
+                st.caption("Check the spelling or try the full official name.")
+            else:
+                st.caption("Add a Groq API key to extract requirements for universities "
+                           "outside the offline database.")
+        else:
+            source_label = (f"Groq · {GROQ_MODEL}" if source == GROQ_SOURCE
+                            else "Bundled offline database")
+            with st.container(border=True):
+                st.subheader(record.get("university") or active_query)
+                st.caption(" · ".join(
+                    part for part in [record.get("country"), f"Source: {source_label}"]
+                    if part))
+
+                sat_min = record.get("sat_min")
+                sat_rec = record.get("sat_recommended")
+                ielts_min = record.get("ielts_min_overall")
+                tuition = record.get("annual_tuition_usd")
+                acceptance = record.get("acceptance_rate")
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("SAT minimum", f"{sat_min:.0f}" if sat_min is not None else "—")
+                m2.metric("SAT recommended",
+                          f"{sat_rec:.0f}" if sat_rec is not None else "—")
+                m3.metric("IELTS minimum",
+                          f"{ielts_min:.1f}" if ielts_min is not None else "—")
+                m4.metric("Annual tuition",
+                          f"${tuition:,.0f}" if tuition is not None else "—")
+                m5.metric("Acceptance rate",
+                          f"{acceptance * 100:.0f}%" if acceptance is not None else "—")
+
+                subscores = [
+                    ("Listening", record.get("ielts_min_listening")),
+                    ("Reading", record.get("ielts_min_reading")),
+                    ("Writing", record.get("ielts_min_writing")),
+                    ("Speaking", record.get("ielts_min_speaking")),
+                ]
+                published = [f"{label} {value:.1f}" for label, value in subscores
+                             if value is not None]
+                if published:
+                    st.markdown("**IELTS subscores:** " + " · ".join(published))
+
+                missing = [label for label, key in [
+                    ("SAT minimum", "sat_min"),
+                    ("SAT recommended", "sat_recommended"),
+                    ("IELTS minimum", "ielts_min_overall"),
+                    ("IELTS subscores", "ielts_min_listening"),
+                    ("annual tuition", "annual_tuition_usd"),
+                    ("acceptance rate", "acceptance_rate"),
+                ] if record.get(key) is None]
+                if missing:
+                    st.caption("Not published in this answer: " + ", ".join(missing) + ".")
+
+            st.caption("These figures are AI-extracted or bundled estimates. Confirm them on "
+                       "the university's admissions page before applying.")
+
+# ---------------------------------------------------------------
+# TAB 4: SIMILAR
 # ---------------------------------------------------------------
 with tab2:
     st.markdown("Pick a university you like. The app compares the scores of all 9 metrics "
@@ -398,7 +502,7 @@ with tab2:
             width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------
-# TAB 4: EXPLORE
+# TAB 5: EXPLORE
 # ---------------------------------------------------------------
 with tab3:
     st.subheader("Countries with the most universities in the top N")
@@ -447,7 +551,7 @@ with tab3:
                "A negative number means better-ranked universities score higher.")
 
 # ---------------------------------------------------------------
-# TAB 5: ABOUT
+# TAB 6: ABOUT
 # ---------------------------------------------------------------
 with tab4:
     st.markdown("""
